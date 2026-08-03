@@ -13,6 +13,21 @@
 	"upload_source_maps": true,
 	"compatibility_flags": [
 		"nodejs_compat"
+	],
+	"d1_databases": [
+		{
+			"binding": "vence_db",
+			"database_name": "vence-db",
+			"database_id": "b86729fa-799d-4182-a8dc-f36e2448b404",
+			"remote": true
+		}
+	],
+	"r2_buckets": [
+		{
+			"bucket_name": "vence-bucket",
+			"binding": "vence_bucket",
+			"remote": true
+		}
 	]
 	/**
 	 * Smart Placement
