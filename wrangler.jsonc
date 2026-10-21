@@ -11,6 +11,13 @@
 		"enabled": true
 	},
 	"upload_source_maps": true,
+	// Uruguay is UTC-3 year-round, so these land at 08:00 and 18:00 local: once
+	// with the morning, once after work. Every cron here must also appear in
+	// SLOT_BY_CRON in src/notifications/reminders.ts, or its run claims the
+	// morning slot and silently sends nothing.
+	"triggers": {
+		"crons": ["0 11 * * *", "0 21 * * *"]
+	},
 	"compatibility_flags": [
 		"nodejs_compat"
 	],
@@ -19,16 +26,45 @@
 			"binding": "vence_db",
 			"database_name": "vence-db",
 			"database_id": "b86729fa-799d-4182-a8dc-f36e2448b404",
-			"remote": true
+			"remote": true,
+			// Lets `wrangler d1 migrations apply` own which files have run,
+			// via its d1_migrations ledger table, instead of the deploy
+			// playbook replaying every file on every run.
+			"migrations_dir": "src/db/migrations"
 		}
 	],
 	"r2_buckets": [
 		{
 			"bucket_name": "vence-bucket",
-			"binding": "vence_bucket",
+			"binding": "BILLS_BUCKET",
 			"remote": true
 		}
-	]
+	],
+	/**
+	 * Test environment. The top-level bindings are marked `remote: true` so that
+	 * `wrangler dev` talks to real data; the test suite must not. A named env
+	 * does not inherit bindings, so they are redeclared here without `remote`,
+	 * which keeps vitest on Miniflare's local D1 and R2.
+	 *
+	 * Used by vitest.config.mts via `wrangler.environment: "test"`.
+	 */
+	"env": {
+		"test": {
+			"d1_databases": [
+				{
+					"binding": "vence_db",
+					"database_name": "vence-db-test",
+					"database_id": "local-test"
+				}
+			],
+			"r2_buckets": [
+				{
+					"bucket_name": "vence-bucket-test",
+					"binding": "BILLS_BUCKET"
+				}
+			]
+		}
+	}
 	/**
 	 * Smart Placement
 	 * https://developers.cloudflare.com/workers/configuration/smart-placement/#smart-placement

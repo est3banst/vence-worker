@@ -11,6 +11,7 @@ interface PreferencesRow {
   reminder_days_before: number;
   notify_by_email: number;
   notify_by_web_push: number;
+  notify_by_push: number;
   updated_at: number;
 }
 
@@ -20,6 +21,7 @@ interface PreferencesDto {
   reminderDaysBefore: number;
   notifyByEmail: boolean;
   notifyByWebPush: boolean;
+  notifyByPush: boolean;
   updatedAt: string;
 }
 
@@ -29,6 +31,7 @@ const DEFAULTS = {
   reminderDaysBefore: 3,
   notifyByEmail: true,
   notifyByWebPush: true,
+  notifyByPush: true,
 };
 
 function toDto(row: PreferencesRow): PreferencesDto {
@@ -38,6 +41,7 @@ function toDto(row: PreferencesRow): PreferencesDto {
     reminderDaysBefore: row.reminder_days_before,
     notifyByEmail: row.notify_by_email === 1,
     notifyByWebPush: row.notify_by_web_push === 1,
+    notifyByPush: row.notify_by_push === 1,
     updatedAt: new Date(row.updated_at * 1000).toISOString(),
   };
 }
@@ -82,6 +86,7 @@ export async function updatePreferences(
     reminder_days_before: DEFAULTS.reminderDaysBefore,
     notify_by_email: 1,
     notify_by_web_push: 1,
+    notify_by_push: 1,
     ...(existing ?? {}),
   };
 
@@ -132,17 +137,25 @@ export async function updatePreferences(
     merged.notify_by_web_push = body.notifyByWebPush ? 1 : 0;
   }
 
+  if (body.notifyByPush !== undefined) {
+    if (typeof body.notifyByPush !== 'boolean') {
+      return json({ error: 'notifyByPush debe ser booleano' }, 400, cors);
+    }
+    merged.notify_by_push = body.notifyByPush ? 1 : 0;
+  }
+
   await env.vence_db.prepare(
     `INSERT INTO user_preferences
        (user_id, default_currency, timezone, reminder_days_before,
-        notify_by_email, notify_by_web_push, created_at, updated_at)
-     VALUES (?1, ?2, ?3, ?4, ?5, ?6, unixepoch(), unixepoch())
+        notify_by_email, notify_by_web_push, notify_by_push, created_at, updated_at)
+     VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, unixepoch(), unixepoch())
      ON CONFLICT(user_id) DO UPDATE SET
        default_currency = excluded.default_currency,
        timezone = excluded.timezone,
        reminder_days_before = excluded.reminder_days_before,
        notify_by_email = excluded.notify_by_email,
        notify_by_web_push = excluded.notify_by_web_push,
+       notify_by_push = excluded.notify_by_push,
        updated_at = unixepoch()`
   ).bind(
     auth.sub,
@@ -151,6 +164,7 @@ export async function updatePreferences(
     merged.reminder_days_before,
     merged.notify_by_email,
     merged.notify_by_web_push,
+    merged.notify_by_push,
   ).run();
 
   const row = await env.vence_db.prepare(

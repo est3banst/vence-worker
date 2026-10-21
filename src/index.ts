@@ -17,7 +17,13 @@ import {
   updateBill, 
   deleteBill} 
 from './bills/bills';
-import { listDocumentsByMonth } from './documents/documents';
+import {
+  uploadDocument,
+  listDocuments,
+  downloadDocument,
+  deleteDocument,
+  listDocumentsByMonth,
+} from './documents/documents';
 import {
   getMySubscription,
   createCheckout,
@@ -27,9 +33,8 @@ import { handleMercadoPagoWebhook } from './handlers/mpago-webhook';
 import { getPreferences, updatePreferences } from './handlers/preferences';
 import { deleteAccount } from './handlers/account';
 import { getByCategory, getMonthlySpend } from './handlers/analytics';
-
-// import { getPreferences, updatePreferences } from './handlers/preferences';
-// import { uploadDocument, listDocuments, downloadDocument, deleteDocument } from './handlers/documents';
+import { listPushTokens, registerPushToken, deletePushToken, sendTestPush } from './handlers/push';
+import { runDailyReminders, slotForCron } from './notifications/reminders';
 
 type Handler = (
   req: Request,
@@ -88,7 +93,6 @@ const routes: Route[] = [
   
   route('PATCH',  '/bills/:id',             (req, env, auth, cors, p) => updateBill(req, env, auth, p.id, cors)),
   route('DELETE', '/bills/:id',             (_req, env, auth, cors, p) => deleteBill(env, auth, p.id, cors)),
-  // route('POST',   '/bills/:id/pay',         (req, env, auth, cors, p) => payBill(req, env, auth, p.id, cors)),
 
   route('GET', '/analytics/summary', (req, env, auth, cors) => getSummary(req, env, auth, cors)),
   route('GET', '/analytics/monthly',     (req, env, auth, cors) => getMonthlySpend(req, env, auth, cors)),
@@ -106,17 +110,23 @@ const routes: Route[] = [
   ),
 
   // ─── Documents ───
-  // route('POST',   '/bills/:billId/documents', (req, env, auth, cors, p) => uploadDocument(req, env, auth, p.billId, cors)),
-  // route('GET',    '/bills/:billId/documents', (_req, env, auth, cors, p) => listDocuments(env, auth, p.billId, cors)),
-  
-  route('GET', '/documents', (req, env, auth, cors) => listDocumentsByMonth(req, env, auth, cors)),
-  // route('GET',    '/documents/:id',           (_req, env, auth, cors, p) => downloadDocument(env, auth, p.id, cors)),
-  // route('DELETE', '/documents/:id',           (_req, env, auth, cors, p) => deleteDocument(env, auth, p.id, cors)),
+  route('POST',   '/bills/:billId/documents', (req, env, auth, cors, p) => uploadDocument(req, env, auth, p.billId, cors)),
+  route('GET',    '/bills/:billId/documents', (_req, env, auth, cors, p) => listDocuments(env, auth, p.billId, cors)),
+
+  route('GET',    '/documents',               (req, env, auth, cors) => listDocumentsByMonth(req, env, auth, cors)),
+  route('GET',    '/documents/:id',           (_req, env, auth, cors, p) => downloadDocument(env, auth, p.id, cors)),
+  route('DELETE', '/documents/:id',           (_req, env, auth, cors, p) => deleteDocument(env, auth, p.id, cors)),
 
   // ─── Preferences ───
   route('GET',    '/preferences',      (req, env, auth, cors) => getPreferences(req, env, auth, cors)),
   route('PATCH',  '/preferences',      (req, env, auth, cors) => updatePreferences(req, env, auth, cors)),
   route('DELETE', '/account',          (req, env, auth, cors) => deleteAccount(req, env, auth, cors)),
+
+  // ─── Push (mobile) ───
+  route('GET',    '/push/tokens', (req, env, auth, cors) => listPushTokens(req, env, auth, cors)),
+  route('POST',   '/push/tokens', (req, env, auth, cors) => registerPushToken(req, env, auth, cors)),
+  route('DELETE', '/push/tokens', (req, env, auth, cors) => deletePushToken(req, env, auth, cors)),
+  route('POST',   '/push/test',   (req, env, auth, cors) => sendTestPush(req, env, auth, cors)),
 
 ];
 
@@ -163,5 +173,21 @@ export default {
       const message = err instanceof Error ? err.message : 'Unknown error';
       return json({ error: message }, 500, cors);
     }
+  },
+
+  // Bill reminders. The crons fire at fixed UTC hours, so everyone is notified
+  // at the same absolute moment — morning and evening for Uruguay. Which pass
+  // this is comes from the cron that fired, because the sweep logs its claim
+  // per slot: without that, the evening run would look like a repeat of the
+  // morning one and skip everybody. Per-user local time would need an hourly
+  // cron that checks each user's zone; not worth it while the audience is one
+  // timezone.
+  async scheduled(controller, env, ctx): Promise<void> {
+    const slot = slotForCron(controller.cron);
+    ctx.waitUntil(
+      runDailyReminders(env, slot)
+        .then(s => console.log('reminder sweep', JSON.stringify(s)))
+        .catch(err => console.error('reminder sweep failed', err))
+    );
   },
 } satisfies ExportedHandler<Env>;

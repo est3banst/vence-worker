@@ -23,7 +23,7 @@ CREATE TABLE IF NOT EXISTS providers (
   name        TEXT NOT NULL,
   category    TEXT NOT NULL CHECK (category IN (
                 'servicios','internet','suscripcion','profesional',
-                'impuesto','alquiler','tarjeta','otro'
+                'impuesto','alquiler','tarjeta','seguro','patente','otro'
               )),
   notes       TEXT,
   created_at  INTEGER NOT NULL DEFAULT (unixepoch()),
@@ -102,7 +102,7 @@ CREATE INDEX IF NOT EXISTS idx_documents_user_uploaded_active
 CREATE TABLE IF NOT EXISTS subscriptions (
   id                        TEXT PRIMARY KEY,
   user_id                   TEXT NOT NULL REFERENCES users(id) ON DELETE CASCADE,
-  tier                      TEXT NOT NULL CHECK (tier IN ('free','pro')),
+  tier                      TEXT NOT NULL CHECK (tier IN ('free','personal','pro')),
   status                    TEXT NOT NULL CHECK (status IN (
                               'active','trialing','past_due','cancelled','expired'
                             )),
@@ -131,6 +131,7 @@ CREATE TABLE IF NOT EXISTS user_preferences (
   reminder_days_before  INTEGER NOT NULL DEFAULT 3 CHECK (reminder_days_before BETWEEN 0 AND 30),
   notify_by_email       INTEGER NOT NULL DEFAULT 1 CHECK (notify_by_email IN (0,1)),
   notify_by_web_push    INTEGER NOT NULL DEFAULT 1 CHECK (notify_by_web_push IN (0,1)),
+  notify_by_push        INTEGER NOT NULL DEFAULT 1 CHECK (notify_by_push IN (0,1)),
   created_at            INTEGER NOT NULL DEFAULT (unixepoch()),
   updated_at            INTEGER NOT NULL DEFAULT (unixepoch())
 );

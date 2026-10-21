@@ -4,7 +4,7 @@ import { json } from '../helpers/helpers';
 
 const VALID_CATEGORIES = [
   'servicios', 'internet', 'suscripcion', 'profesional',
-  'impuesto', 'alquiler', 'tarjeta', 'otro',
+  'impuesto', 'alquiler', 'tarjeta', 'seguro', 'patente', 'otro',
 ] as const;
 
 interface ProviderRow {
@@ -40,7 +40,7 @@ export async function createProvider(
 
   const name = typeof body.name === 'string' ? body.name.trim() : '';
   const category = typeof body.category === 'string' ? body.category : '';
-  const notes = typeof body.notes === 'string' ? body.notes.trim() : null;
+  const notes = typeof body.notes === 'string' && body.notes.trim() ? body.notes.trim() : null;
 
   if (!name || name.length > 200) {
     return json({ error: 'name requerido (1-200 caracteres)' }, 400, cors);

@@ -1,7 +1,7 @@
 import type { Env } from '../env';
 import type { AuthContext } from '../auth';
 import { json } from '../helpers/helpers';
-import { PLANS, type Plan } from '../lib/plans';
+import { PLANS, type Plan } from '../helpers/plans';
 
 const MP_API = 'https://api.mercadopago.com';
 
@@ -92,8 +92,8 @@ export async function createCheckout(
     auto_recurring: {
       frequency: plan.frequency,
       frequency_type: plan.frequencyType,
-      transaction_amount: plan.amountUsd,
-      currency_id: 'USD',
+      transaction_amount: plan.amount,
+      currency_id: plan.currency,
     },
     back_url: `${env.ALLOWED_ORIGIN}/dashboard?checkout=return`,
     status: 'pending',

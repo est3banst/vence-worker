@@ -1,0 +1,273 @@
+---
+# Worker-only loop: test and deploy just vence-worker.
+#
+#   ansible-playbook worker.yml                           # test, then deploy
+#   ansible-playbook worker.yml --tags test               # tests only
+#   ansible-playbook worker.yml -e apply_migrations=true  # migrations too
+#   ansible-playbook worker.yml --check                   # dry run
+#
+# For the whole stack — worker + web + mobile checks, API parity, Pages upload —
+# use ../../7vence/deploy/site.yml. That one is authoritative; this is the
+# narrow loop for when you are only touching the worker, and deliberately skips
+# the web build and the cross-client parity check.
+#
+# Tags live on individual tasks, never on an include. A tag on an include is
+# added to every task inside it, which is how a `--tags test` run once managed
+# to deploy.
+
+- name: vence-worker
+  hosts: local
+  gather_facts: true
+  any_errors_fatal: true
+
+  vars:
+    worker_dir: "{{ playbook_dir }}/.."
+    d1_database: vence-db
+    worker_health_url: "https://vence-worker.est3bandev-account.workers.dev/health"
+    run_tests: true
+    deploy: true
+    apply_migrations: false
+    allow_dirty: false
+
+    # Tables this revision of the worker queries. Checked against the live
+    # database before deploying, because shipping ahead of the schema produces
+    # routes that answer and then 500 on every insert.
+    required_tables:
+      - users
+      - providers
+      - bills
+      - documents
+      - subscriptions
+      - user_preferences
+      - push_tokens
+      - reminder_log
+
+  tasks:
+    # ───────────────────────── preflight ─────────────────────────
+
+    - name: Work out whether this run will deploy
+      ansible.builtin.set_fact:
+        will_deploy: >-
+          {{ (deploy | bool)
+             and (('all' in ansible_run_tags) or ('deploy' in ansible_run_tags)) }}
+      tags: always
+
+    - name: Summarise the run
+      ansible.builtin.debug:
+        msg:
+          - "tests:      {{ 'yes' if run_tests | bool else 'skipped' }}"
+          - "migrations: {{ 'YES' if apply_migrations | bool else 'no' }}"
+          - "deploy:     {{ 'yes' if will_deploy | bool else 'no' }}"
+      tags: always
+
+    - name: Check the tools this playbook shells out to
+      ansible.builtin.command: "{{ item }} --version"
+      register: tool_versions
+      changed_when: false
+      check_mode: false
+      loop: [node, npx]
+      tags: always
+
+    - name: Require Node 20 or newer
+      ansible.builtin.assert:
+        that: >-
+          {{ tool_versions.results[0].stdout | regex_replace('^v([0-9]+).*$', '\1') | int >= 20 }}
+        fail_msg: "Node {{ tool_versions.results[0].stdout }} is too old; this project needs >= 20."
+        success_msg: "Node {{ tool_versions.results[0].stdout }} OK."
+      tags: always
+
+    - name: Look for a Cloudflare token
+      ansible.builtin.stat:
+        path: "{{ worker_dir }}/.env"
+      register: worker_env
+      tags: always
+
+    - name: Require credentials before deploying
+      ansible.builtin.assert:
+        that:
+          - (lookup('ansible.builtin.env', 'CLOUDFLARE_API_TOKEN') | length > 0) or worker_env.stat.exists
+        fail_msg: >-
+          No Cloudflare credentials. Export CLOUDFLARE_API_TOKEN or put it in
+          {{ worker_dir }}/.env, which wrangler loads automatically. The token
+          needs Workers Scripts:Edit, Workers R2 Storage:Edit and D1:Edit.
+        success_msg: "Cloudflare credentials available."
+      when: will_deploy | bool
+      tags: always
+
+    - name: Check the git worktree
+      ansible.builtin.command:
+        cmd: git status --porcelain
+        chdir: "{{ worker_dir }}"
+      register: git_state
+      changed_when: false
+      failed_when: false
+      check_mode: false
+      tags: always
+
+    - name: Refuse to deploy uncommitted code
+      ansible.builtin.fail:
+        msg: >-
+          vence-worker has uncommitted changes, so a deploy would ship code that
+          is in no commit. Commit them, or re-run with -e allow_dirty=true.
+      when:
+        - will_deploy | bool
+        - not (allow_dirty | bool)
+        - git_state.stdout | default('') | length > 0
+      tags: always
+
+    - name: Ask the live database which tables exist
+      ansible.builtin.command:
+        cmd: >-
+          npx wrangler d1 execute {{ d1_database }} --remote --json
+          --command "SELECT name FROM sqlite_master WHERE type='table'"
+        chdir: "{{ worker_dir }}"
+      register: live_tables
+      changed_when: false
+      failed_when: false
+      check_mode: false
+      when: will_deploy | bool
+      tags: always
+
+    - name: Work out which tables are missing
+      ansible.builtin.set_fact:
+        missing_tables: "{{ required_tables | reject('in', live_tables.stdout | default('')) | list }}"
+      when:
+        - will_deploy | bool
+        - live_tables.rc | default(1) == 0
+      tags: always
+
+    - name: Refuse to deploy ahead of the schema
+      ansible.builtin.fail:
+        msg: >-
+          The live database is missing {{ missing_tables | join(', ') }}.
+          Deploying now would ship routes whose inserts fail with a 500. Apply
+          the migrations first, or add -e apply_migrations=true.
+      when:
+        - will_deploy | bool
+        - missing_tables | default([]) | length > 0
+        - not (apply_migrations | bool)
+      tags: always
+
+    # ─────────────────────────── test ───────────────────────────
+
+    - name: Worker checks
+      when: run_tests | bool
+      tags: [test]
+      block:
+        - name: Install dependencies from the lockfile
+          ansible.builtin.command:
+            cmd: npm ci
+            chdir: "{{ worker_dir }}"
+          register: install
+          changed_when: "'added' in install.stdout or 'removed' in install.stdout"
+
+        - name: Typecheck
+          ansible.builtin.command:
+            cmd: npx tsc --noEmit
+            chdir: "{{ worker_dir }}"
+          changed_when: false
+          check_mode: false
+
+        - name: Run the test suite
+          ansible.builtin.command:
+            cmd: npx vitest run --reporter=dot
+            chdir: "{{ worker_dir }}"
+          register: tests
+          changed_when: false
+          check_mode: false
+
+        - name: Show the test summary
+          ansible.builtin.debug:
+            msg: "{{ tests.stdout_lines | select('search', 'Tests  |Test Files') | list }}"
+
+        - name: Verify the bundle builds before anything ships
+          ansible.builtin.command:
+            cmd: npx wrangler deploy --dry-run --outdir /tmp/vence-worker-dryrun
+            chdir: "{{ worker_dir }}"
+          register: dryrun
+          changed_when: false
+          check_mode: false
+
+        - name: Confirm the bundle exposes the bindings the code reads
+          ansible.builtin.assert:
+            that:
+              - "'env.vence_db' in dryrun.stdout"
+              - "'env.BILLS_BUCKET' in dryrun.stdout"
+            fail_msg: >-
+              The dry-run did not report both bindings. A renamed binding in
+              wrangler.jsonc is undefined at runtime with no build error at all.
+            success_msg: "Bindings vence_db and BILLS_BUCKET present."
+
+    # ────────────────────────── deploy ──────────────────────────
+
+    - name: Apply D1 migrations
+      # `migrations apply` consults the d1_migrations ledger and runs only what
+      # is outstanding. The previous version replayed every file on every run,
+      # which fails the moment a migration is not idempotent -- 0001 on a
+      # FOREIGN KEY violation, 0002 on a duplicate column.
+      #
+      # A database migrated before this pipeline existed has no ledger and will
+      # look entirely unapplied. Back it up once with
+      # src/db/bootstrap-migration-ledger.sql before running this.
+      ansible.builtin.command:
+        cmd: npx wrangler d1 migrations apply {{ d1_database }} --remote
+        chdir: "{{ worker_dir }}"
+      register: migrated
+      changed_when: "'No migrations to apply' not in migrated.stdout"
+      when: apply_migrations | bool
+      tags: [deploy, migrate]
+
+    - name: Report migrations
+      ansible.builtin.debug:
+        msg: >-
+          {{ 'Already up to date.' if not migrated.changed
+             else migrated.stdout_lines | select('search', '🌀|✅|Success') | list }}
+      when: apply_migrations | bool
+      tags: [deploy, migrate]
+
+    - name: Deploy
+      when: deploy | bool
+      tags: [deploy]
+      block:
+        - name: Push the worker to Cloudflare
+          ansible.builtin.command:
+            cmd: npx wrangler deploy
+            chdir: "{{ worker_dir }}"
+          register: deployed
+
+        - name: Report the deployed version
+          ansible.builtin.debug:
+            msg: "{{ deployed.stdout_lines | select('search', 'Version ID|Current Version') | list }}"
+
+    # ────────────────────────── verify ──────────────────────────
+
+    - name: Wait for the worker to answer /health
+      ansible.builtin.uri:
+        url: "{{ worker_health_url }}"
+        return_content: true
+        status_code: 200
+        timeout: 15
+      register: health
+      retries: 6
+      delay: 5
+      until: health.status == 200
+      changed_when: false
+      when: deploy | bool
+      tags: [deploy, verify]
+
+    - name: Confirm the health payload
+      ansible.builtin.assert:
+        that: health.json.ok | default(false)
+        fail_msg: "Answered {{ health.status }} but the body was {{ health.content | default('empty') }}."
+        success_msg: "Worker is live at {{ worker_health_url }}."
+      when: deploy | bool
+      tags: [deploy, verify]
+
+    - name: Confirm an unauthenticated route is still refused
+      ansible.builtin.uri:
+        url: "{{ worker_health_url | regex_replace('/health$', '/bills') }}"
+        status_code: 401
+        timeout: 15
+      changed_when: false
+      when: deploy | bool
+      tags: [deploy, verify]
