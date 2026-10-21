@@ -1,5 +1,5 @@
 import type { Env } from '../env';
-import { sendPush, type PushMessage } from './expo';
+import { sendPush, checkReceipts, receiptWait, type PushMessage } from './expo';
 import { disableTokens } from '../handlers/push';
 
 const DEFAULT_TZ = 'America/Montevideo';
@@ -138,11 +138,18 @@ export interface SweepSummary {
   slot: ReminderSlot;
   usersConsidered: number;
   usersNotified: number;
+  /** Accepted by Expo. */
   pushesSent: number;
+  /** Confirmed delivered by the device's transport. */
+  pushesDelivered: number;
   tokensDisabled: number;
   skippedAlreadySent: number;
   errors: string[];
 }
+
+// Expo needs a moment to turn an accepted ticket into a receipt. The sweep runs
+// on a cron with nobody waiting on it, so it can simply pause and ask.
+const RECEIPT_WAIT_MS = 2000;
 
 /**
  * One pass of the daily sweep. Idempotent per user per local day *per slot* via
@@ -155,7 +162,7 @@ export async function runDailyReminders(
 ): Promise<SweepSummary> {
   const summary: SweepSummary = {
     slot,
-    usersConsidered: 0, usersNotified: 0, pushesSent: 0,
+    usersConsidered: 0, usersNotified: 0, pushesSent: 0, pushesDelivered: 0,
     tokensDisabled: 0, skippedAlreadySent: 0, errors: [],
   };
 
@@ -242,9 +249,22 @@ export async function runDailyReminders(
     summary.pushesSent = result.sent;
     summary.errors.push(...result.errors);
 
-    if (result.deadTokens.length) {
-      await disableTokens(env, result.deadTokens);
-      summary.tokensDisabled = result.deadTokens.length;
+    const dead = new Set(result.deadTokens);
+
+    // An accepted ticket is not a delivered notification. Without this check a
+    // token whose install is gone keeps being "sent" to on every sweep, forever
+    // — the send looks clean and the phone stays silent.
+    if (result.tickets.length > 0) {
+      await receiptWait(env, RECEIPT_WAIT_MS);
+      const receipts = await checkReceipts(env, result.tickets);
+      summary.pushesDelivered = receipts.delivered;
+      summary.errors.push(...receipts.errors);
+      receipts.deadTokens.forEach(t => dead.add(t));
+    }
+
+    if (dead.size > 0) {
+      await disableTokens(env, [...dead]);
+      summary.tokensDisabled = dead.size;
     }
 
     // The slot is claimed before sending so a retry can't buzz anyone twice.

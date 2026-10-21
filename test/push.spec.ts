@@ -13,13 +13,35 @@ afterEach(() => { vi.restoreAllMocks(); });
 
 const TOKEN = 'ExponentPushToken[AAAAAAAAAAAAAAAAAAAAAA]';
 
-/** Stands in for Expo's push service so no test reaches the network. */
-function stubExpo(tickets: unknown[], ok = true, status = 200) {
+/**
+ * Stands in for Expo's push service so no test reaches the network.
+ *
+ * Expo has two endpoints with different response shapes: /push/send answers an
+ * array of tickets, /push/getReceipts a map keyed by ticket id. `receipts`
+ * left undefined means every accepted ticket comes back delivered, which is
+ * what the happy path looks like.
+ */
+function stubExpo(
+  tickets: unknown[],
+  receipts?: Record<string, unknown>,
+  status = 200,
+) {
   return vi.spyOn(globalThis, 'fetch').mockImplementation(async (input) => {
     const url = typeof input === 'string' ? input : (input as Request).url;
     if (!url.includes('exp.host')) throw new Error(`unexpected fetch to ${url}`);
-    return new Response(JSON.stringify({ data: tickets }), {
-      status: ok ? status : status,
+
+    const body = url.includes('getReceipts')
+      ? {
+          data: receipts ?? Object.fromEntries(
+            tickets
+              .filter((t): t is { id: string } => typeof (t as { id?: string }).id === 'string')
+              .map(t => [t.id, { status: 'ok' }])
+          ),
+        }
+      : { data: tickets };
+
+    return new Response(JSON.stringify(body), {
+      status,
       headers: { 'Content-Type': 'application/json' },
     });
   });
@@ -172,6 +194,33 @@ describe('DELETE /push/tokens', () => {
     const { status } = await callJson('/push/tokens', { method: 'DELETE', body: {} });
     expect(status).toBe(400);
   });
+
+  // A client that reinstalled holds a different token from the one on file, so
+  // its delete matches nothing. Answering `deleted: true` there is what let the
+  // app report a device switched off while the server still held it.
+  it('reports deleted: false when no row matched', async () => {
+    await callJson('/push/tokens', { method: 'POST', body: { token: TOKEN, platform: 'android' } });
+
+    const stale = 'ExponentPushToken[ZZZZZZZZZZZZZZZZZZZZZZ]';
+    const miss = await callJson<{ deleted: boolean }>(
+      '/push/tokens', { method: 'DELETE', body: { token: stale } }
+    );
+    expect(miss.status).toBe(200);
+    expect(miss.body.deleted).toBe(false);
+
+    const hit = await callJson<{ deleted: boolean }>(
+      '/push/tokens', { method: 'DELETE', body: { token: TOKEN } }
+    );
+    expect(hit.body.deleted).toBe(true);
+  });
+
+  it('reports deleted: false when another account owns the token', async () => {
+    await callJson('/push/tokens', { method: 'POST', body: { token: TOKEN, platform: 'android' } });
+    const { body } = await callJson<{ deleted: boolean }>(
+      '/push/tokens', { method: 'DELETE', body: { token: TOKEN }, token: 'user-b' }
+    );
+    expect(body.deleted).toBe(false);
+  });
 });
 
 describe('POST /push/test', () => {
@@ -185,11 +234,11 @@ describe('POST /push/test', () => {
     const spy = stubExpo([{ status: 'ok', id: 't1' }]);
     await callJson('/push/tokens', { method: 'POST', body: { token: TOKEN, platform: 'android' } });
 
-    const { status, body } = await callJson<{ devices: number; sent: number; errors: string[] }>(
-      '/push/test', { method: 'POST' }
-    );
+    const { status, body } = await callJson<{
+      devices: number; sent: number; delivered: number; pending: number; errors: string[];
+    }>('/push/test', { method: 'POST' });
     expect(status).toBe(200);
-    expect(body).toMatchObject({ devices: 1, sent: 1, errors: [] });
+    expect(body).toMatchObject({ devices: 1, sent: 1, delivered: 1, pending: 0, errors: [] });
 
     const [, init] = spy.mock.calls[0];
     const payload = JSON.parse((init as RequestInit).body as string);
@@ -219,6 +268,66 @@ describe('POST /push/test', () => {
     expect(body.sent).toBe(0);
     expect(body.disabled).toBe(0);
     expect(body.errors).toContain('MismatchSenderId');
+  });
+
+  // The failure this endpoint exists to catch, and the one it used to miss:
+  // Expo accepts the message, then the transport rejects it. Only the receipt
+  // says so.
+  it('reports a token the receipt rejects, and retires it', async () => {
+    stubExpo(
+      [{ status: 'ok', id: 't1' }],
+      { t1: {
+        status: 'error',
+        message: 'The recipient device is not registered with FCM.',
+        details: { error: 'DeviceNotRegistered' },
+      } },
+    );
+    await callJson('/push/tokens', { method: 'POST', body: { token: TOKEN, platform: 'android' } });
+
+    const { body } = await callJson<{
+      sent: number; delivered: number; disabled: number; errors: string[];
+    }>('/push/test', { method: 'POST' });
+
+    // Expo took it, the device never got it. Saying "sent 1" alone is the lie.
+    expect(body.sent).toBe(1);
+    expect(body.delivered).toBe(0);
+    expect(body.disabled).toBe(1);
+    expect(body.errors.join(' ')).toContain('not registered with FCM');
+
+    const row = await env.vence_db
+      .prepare('SELECT disabled_at FROM push_tokens WHERE token = ?1')
+      .bind(TOKEN).first<{ disabled_at: number | null }>();
+    expect(row?.disabled_at).not.toBeNull();
+  });
+
+  it('leaves the token alone when a receipt fails for a transient reason', async () => {
+    stubExpo(
+      [{ status: 'ok', id: 't1' }],
+      { t1: { status: 'error', message: 'MessageRateExceeded', details: { error: 'MessageRateExceeded' } } },
+    );
+    await callJson('/push/tokens', { method: 'POST', body: { token: TOKEN, platform: 'android' } });
+
+    const { body } = await callJson<{ delivered: number; disabled: number; errors: string[] }>(
+      '/push/test', { method: 'POST' }
+    );
+    expect(body.delivered).toBe(0);
+    expect(body.disabled).toBe(0);
+    expect(body.errors.join(' ')).toContain('MessageRateExceeded');
+
+    const row = await env.vence_db
+      .prepare('SELECT disabled_at FROM push_tokens WHERE token = ?1')
+      .bind(TOKEN).first<{ disabled_at: number | null }>();
+    expect(row?.disabled_at).toBeNull();
+  });
+
+  it('reports an undecided receipt as pending rather than as a failure', async () => {
+    stubExpo([{ status: 'ok', id: 't1' }], {});
+    await callJson('/push/tokens', { method: 'POST', body: { token: TOKEN, platform: 'android' } });
+
+    const { body } = await callJson<{
+      sent: number; delivered: number; pending: number; disabled: number;
+    }>('/push/test', { method: 'POST' });
+    expect(body).toMatchObject({ sent: 1, delivered: 0, pending: 1, disabled: 0 });
   });
 
   it('skips a disabled device', async () => {

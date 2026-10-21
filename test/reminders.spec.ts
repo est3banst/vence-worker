@@ -28,15 +28,38 @@ interface SentMessage {
   data?: { kind?: string; slot?: string; billIds?: string[] };
 }
 
-/** Captures what would have gone to Expo, and replies with the given tickets. */
-function stubExpo(makeTickets?: (msgs: SentMessage[]) => unknown[]) {
+/**
+ * Captures what would have gone to Expo, and replies with the given tickets.
+ *
+ * Expo's two endpoints answer different shapes: /push/send an array of tickets,
+ * /push/getReceipts a map keyed by ticket id. `makeReceipts` left undefined
+ * means every accepted ticket comes back delivered.
+ */
+function stubExpo(
+  makeTickets?: (msgs: SentMessage[]) => unknown[],
+  makeReceipts?: (ids: string[]) => Record<string, unknown>,
+) {
   const sent: SentMessage[] = [];
+  let nextTicket = 0;
   vi.spyOn(globalThis, 'fetch').mockImplementation(async (input, init) => {
     const url = typeof input === 'string' ? input : (input as Request).url;
     if (!url.includes('exp.host')) throw new Error(`unexpected fetch to ${url}`);
-    const batch = JSON.parse((init as RequestInit).body as string) as SentMessage[];
+    const body = JSON.parse((init as RequestInit).body as string) as
+      | SentMessage[]
+      | { ids: string[] };
+
+    if (url.includes('getReceipts')) {
+      const { ids } = body as { ids: string[] };
+      const data = makeReceipts?.(ids)
+        ?? Object.fromEntries(ids.map(id => [id, { status: 'ok' }]));
+      return new Response(JSON.stringify({ data }), { status: 200 });
+    }
+
+    const batch = body as SentMessage[];
     sent.push(...batch);
-    const tickets = makeTickets?.(batch) ?? batch.map(() => ({ status: 'ok', id: 'tk' }));
+    // Distinct ids, so a receipt can be aimed at one message of a batch.
+    const tickets = makeTickets?.(batch)
+      ?? batch.map(() => ({ status: 'ok', id: `tk-${nextTicket++}` }));
     return new Response(JSON.stringify({ data: tickets }), { status: 200 });
   });
   return sent;
@@ -312,6 +335,122 @@ describe('dead token handling', () => {
     const summary = await runDailyReminders(env);
     expect(summary.pushesSent).toBe(0);
     expect(summary.errors.join(' ')).toContain('ECONNRESET');
+  });
+});
+
+describe('delivery receipts', () => {
+  it('counts a delivered push', async () => {
+    await registerToken(TOKEN_A);
+    await seedBill({ id: 'b-1', providerId: 'p-1', dueDate: isoDaysFromLocalToday(1) });
+
+    stubExpo();
+    const summary = await runDailyReminders(env);
+    expect(summary).toMatchObject({ pushesSent: 1, pushesDelivered: 1, tokensDisabled: 0 });
+  });
+
+  // The quiet failure: Expo accepts the message and the transport drops it,
+  // which only the receipt reveals. Left unchecked, the sweep "sends" to this
+  // token twice a day forever and the phone never makes a sound.
+  it('retires a token the receipt reports as DeviceNotRegistered', async () => {
+    await registerToken(TOKEN_A);
+    await seedBill({ id: 'b-1', providerId: 'p-1', dueDate: isoDaysFromLocalToday(1) });
+
+    stubExpo(undefined, ids => Object.fromEntries(ids.map(id => [id, {
+      status: 'error',
+      message: 'The recipient device is not registered with FCM.',
+      details: { error: 'DeviceNotRegistered' },
+    }])));
+
+    const summary = await runDailyReminders(env);
+    expect(summary.pushesSent).toBe(1);
+    expect(summary.pushesDelivered).toBe(0);
+    expect(summary.tokensDisabled).toBe(1);
+    expect(summary.errors.join(' ')).toContain('not registered with FCM');
+
+    const row = await env.vence_db
+      .prepare('SELECT disabled_at FROM push_tokens WHERE token = ?1')
+      .bind(TOKEN_A).first<{ disabled_at: number | null }>();
+    expect(row?.disabled_at).not.toBeNull();
+  });
+
+  it('keeps a token whose receipt failed for a transient reason', async () => {
+    await registerToken(TOKEN_A);
+    await seedBill({ id: 'b-1', providerId: 'p-1', dueDate: isoDaysFromLocalToday(1) });
+
+    stubExpo(undefined, ids => Object.fromEntries(ids.map(id => [id, {
+      status: 'error', message: 'MessageRateExceeded', details: { error: 'MessageRateExceeded' },
+    }])));
+
+    const summary = await runDailyReminders(env);
+    expect(summary.tokensDisabled).toBe(0);
+    expect(summary.errors.join(' ')).toContain('MessageRateExceeded');
+
+    const row = await env.vence_db
+      .prepare('SELECT disabled_at FROM push_tokens WHERE token = ?1')
+      .bind(TOKEN_A).first<{ disabled_at: number | null }>();
+    expect(row?.disabled_at).toBeNull();
+  });
+
+  it('retires only the device whose receipt failed', async () => {
+    await registerToken(TOKEN_A);
+    await registerToken(TOKEN_A2);
+    await seedBill({ id: 'b-1', providerId: 'p-1', dueDate: isoDaysFromLocalToday(1) });
+
+    // Aim the failure at whichever ticket carried TOKEN_A2.
+    let doomed = '';
+    stubExpo(
+      batch => batch.map((m, i) => {
+        const id = `tk-${i}`;
+        if (m.to === TOKEN_A2) doomed = id;
+        return { status: 'ok', id };
+      }),
+      ids => Object.fromEntries(ids.map(id => [
+        id,
+        id === doomed
+          ? { status: 'error', message: 'gone', details: { error: 'DeviceNotRegistered' } }
+          : { status: 'ok' },
+      ])),
+    );
+
+    const summary = await runDailyReminders(env);
+    expect(summary.pushesDelivered).toBe(1);
+    expect(summary.tokensDisabled).toBe(1);
+
+    const { results } = await env.vence_db
+      .prepare('SELECT token FROM push_tokens WHERE disabled_at IS NULL')
+      .all<{ token: string }>();
+    expect(results.map(r => r.token)).toEqual([TOKEN_A]);
+  });
+
+  it('treats an undecided receipt as neither delivered nor dead', async () => {
+    await registerToken(TOKEN_A);
+    await seedBill({ id: 'b-1', providerId: 'p-1', dueDate: isoDaysFromLocalToday(1) });
+
+    stubExpo(undefined, () => ({}));
+    const summary = await runDailyReminders(env);
+    expect(summary).toMatchObject({ pushesSent: 1, pushesDelivered: 0, tokensDisabled: 0 });
+  });
+
+  it('does not fail the sweep when the receipt call itself breaks', async () => {
+    await registerToken(TOKEN_A);
+    await seedBill({ id: 'b-1', providerId: 'p-1', dueDate: isoDaysFromLocalToday(1) });
+
+    let call = 0;
+    vi.spyOn(globalThis, 'fetch').mockImplementation(async () => {
+      call++;
+      // First call is the send, second is the receipt lookup.
+      if (call === 1) return new Response(JSON.stringify({ data: [{ status: 'ok', id: 'tk-0' }] }), { status: 200 });
+      return new Response('receipts down', { status: 502 });
+    });
+
+    const summary = await runDailyReminders(env);
+    expect(summary.pushesSent).toBe(1);
+    expect(summary.tokensDisabled).toBe(0);
+    expect(summary.errors.join(' ')).toContain('502');
+
+    // The claim stands: the push itself was accepted, so no retry is owed.
+    const { results } = await env.vence_db.prepare('SELECT user_id FROM reminder_log').all();
+    expect(results).toHaveLength(1);
   });
 });
 

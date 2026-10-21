@@ -2,14 +2,21 @@
 
 The narrow loop: test and deploy **only** this worker.
 
-```bash
-cd deploy
+Run from the repo root (or anywhere — the play targets the implicit localhost,
+so it needs no inventory):
 
-ansible-playbook worker.yml                           # test, then deploy
-ansible-playbook worker.yml --tags test               # tests only
-ansible-playbook worker.yml -e apply_migrations=true  # migrations too
-ansible-playbook worker.yml --check                   # dry run
+```bash
+ansible-playbook deploy/worker.yml                           # test, then deploy
+ansible-playbook deploy/worker.yml --tags test               # tests only
+ansible-playbook deploy/worker.yml -e apply_migrations=true  # migrations too
+ansible-playbook deploy/worker.yml --check                   # dry run
 ```
+
+It used to target a host from `inventory.ini`, which only loaded when the
+working directory was `deploy/` — `ansible.cfg` is read from the working
+directory, not from the playbook's. Run from anywhere else and the pattern
+matched no hosts, which Ansible treats as a warning: the run exited 0 having
+deployed nothing.
 
 ## Relationship to the full pipeline
 

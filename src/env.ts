@@ -18,4 +18,9 @@ export interface Env {
   // Optional. Required once "Enhanced Security for Push Notifications" is on
   // for the Expo project; Expo recommends setting it either way.
   EXPO_ACCESS_TOKEN?: string;
+
+  // How long to let Expo turn an accepted ticket into a receipt, in ms.
+  // Unset in production, where the defaults apply; the test env sets "0" so the
+  // suite doesn't spend real seconds waiting on a stubbed fetch.
+  PUSH_RECEIPT_WAIT_MS?: string;
 }

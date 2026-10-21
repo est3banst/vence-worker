@@ -1,10 +1,17 @@
 ---
 # Worker-only loop: test and deploy just vence-worker.
 #
-#   ansible-playbook worker.yml                           # test, then deploy
-#   ansible-playbook worker.yml --tags test               # tests only
-#   ansible-playbook worker.yml -e apply_migrations=true  # migrations too
-#   ansible-playbook worker.yml --check                   # dry run
+#   ansible-playbook deploy/worker.yml                           # test, then deploy
+#   ansible-playbook deploy/worker.yml --tags test               # tests only
+#   ansible-playbook deploy/worker.yml -e apply_migrations=true  # migrations too
+#   ansible-playbook deploy/worker.yml --check                   # dry run
+#
+# Runnable from any directory. The play targets the implicit localhost rather
+# than a host out of deploy/inventory.ini, because ansible.cfg is only read from
+# the working directory: run this from the repo root and the inventory is never
+# loaded, so an inventory host pattern matches nothing — and a play with no
+# hosts is not an error. That exits 0 having deployed nothing, which is the one
+# failure a deploy script must never have.
 #
 # For the whole stack — worker + web + mobile checks, API parity, Pages upload —
 # use ../../7vence/deploy/site.yml. That one is authoritative; this is the
@@ -16,7 +23,8 @@
 # to deploy.
 
 - name: vence-worker
-  hosts: local
+  hosts: localhost
+  connection: local
   gather_facts: true
   any_errors_fatal: true
 
@@ -252,15 +260,20 @@
       delay: 5
       until: health.status == 200
       changed_when: false
-      when: deploy | bool
+      when: deploy | bool and not ansible_check_mode
       tags: [deploy, verify]
 
+    # `fail_msg` is templated when the task's arguments are built, not when the
+    # assertion fails, so every field has to survive a run where the fetch above
+    # never happened — which is exactly what a --check run is.
     - name: Confirm the health payload
       ansible.builtin.assert:
         that: health.json.ok | default(false)
-        fail_msg: "Answered {{ health.status }} but the body was {{ health.content | default('empty') }}."
+        fail_msg: >-
+          Answered {{ health.status | default('nothing') }}
+          but the body was {{ health.content | default('empty') }}.
         success_msg: "Worker is live at {{ worker_health_url }}."
-      when: deploy | bool
+      when: deploy | bool and not ansible_check_mode
       tags: [deploy, verify]
 
     - name: Confirm an unauthenticated route is still refused
@@ -269,5 +282,5 @@
         status_code: 401
         timeout: 15
       changed_when: false
-      when: deploy | bool
+      when: deploy | bool and not ansible_check_mode
       tags: [deploy, verify]

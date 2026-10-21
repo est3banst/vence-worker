@@ -50,6 +50,7 @@
 	 */
 	"env": {
 		"test": {
+			"vars": { "PUSH_RECEIPT_WAIT_MS": "0" },
 			"d1_databases": [
 				{
 					"binding": "vence_db",

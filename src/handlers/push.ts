@@ -1,7 +1,7 @@
 import type { Env } from '../env';
 import type { AuthContext } from '../auth';
 import { json } from '../helpers/helpers';
-import { sendPush } from '../notifications/expo';
+import { sendPush, checkReceipts, receiptWait } from '../notifications/expo';
 
 const VALID_PLATFORMS = ['ios', 'android'] as const;
 
@@ -98,16 +98,32 @@ export async function deletePushToken(
   const token = typeof body?.token === 'string' ? body.token.trim() : '';
   if (!token) return json({ error: 'token requerido' }, 400, cors);
 
-  await env.vence_db.prepare(
+  const res = await env.vence_db.prepare(
     `DELETE FROM push_tokens WHERE token = ?1 AND user_id = ?2`
   ).bind(token, auth.sub).run();
 
-  return json({ deleted: true }, 200, cors);
+  // Whether a row actually went is the difference between "you're unregistered"
+  // and "that token was never here" — which is what a client sees when its
+  // install has rotated its token and the old one is still on file. Reporting
+  // `true` for a no-op is how the UI came to claim a device was switched off
+  // while the server still held it.
+  return json({ deleted: (res.meta?.changes ?? 0) > 0 }, 200, cors);
 }
 
+// How long to give Expo to produce a receipt before reporting back. Delivery
+// errors land in seconds; this only has to outlast that, not the slowest case.
+const RECEIPT_WAIT_MS = 1500;
+const RECEIPT_ATTEMPTS = 3;
+
 /**
- * POST /push/test — send a push to the caller's own devices.
- * Exists so the whole loop can be verified without waiting for the cron.
+ * POST /push/test — send a push to the caller's own devices and report whether
+ * it was *delivered*.
+ *
+ * Exists so the whole loop can be verified without waiting for the cron, which
+ * means it has to check receipts rather than tickets. Reporting an accepted
+ * ticket as success made this endpoint answer "sent to 1 of 1 device" for a
+ * token that FCM had already stopped recognising — the one question the button
+ * exists to answer, answered wrongly.
  */
 export async function sendTestPush(
   _req: Request,
@@ -132,15 +148,37 @@ export async function sendTestPush(
     channelId: 'reminders',
   })));
 
-  if (result.deadTokens.length) {
-    await disableTokens(env, result.deadTokens);
+  const dead = new Set(result.deadTokens);
+  let delivered = 0;
+  let pending = result.tickets.length;
+  // Each round replaces the last rather than appending: a receipt that was
+  // merely undecided a second ago should not leave an error behind once it
+  // resolves. Only the final round's findings are reported.
+  let receiptErrors: string[] = [];
+
+  // Poll until every accepted message has a verdict, or the attempts run out.
+  for (let attempt = 0; attempt < RECEIPT_ATTEMPTS && pending > 0; attempt++) {
+    await receiptWait(env, RECEIPT_WAIT_MS);
+    const receipts = await checkReceipts(env, result.tickets);
+    delivered = receipts.delivered;
+    pending = receipts.pending;
+    receiptErrors = receipts.errors;
+    receipts.deadTokens.forEach(t => dead.add(t));
   }
+
+  const errors = [...result.errors, ...receiptErrors];
+
+  if (dead.size > 0) await disableTokens(env, [...dead]);
 
   return json({
     devices: tokens.length,
+    // Accepted by Expo. Kept because an older client reads it.
     sent: result.sent,
-    disabled: result.deadTokens.length,
-    errors: result.errors,
+    // Confirmed on the device's transport — this is the one that matters.
+    delivered,
+    pending,
+    disabled: dead.size,
+    errors,
   }, 200, cors);
 }
 
