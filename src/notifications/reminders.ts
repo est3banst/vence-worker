@@ -1,9 +1,19 @@
 import type { Env } from '../env';
 import { sendPush, checkReceipts, receiptWait, type PushMessage } from './expo';
 import { disableTokens } from '../handlers/push';
+import { DEFAULT_TZ, todayIn, daysBetween } from '../helpers/dates';
 
-const DEFAULT_TZ = 'America/Montevideo';
+// Re-exported because the date rules are shared with bills.ts, which must
+// agree with the sweep on which day it is.
+export { todayIn, daysBetween };
+
 const DEFAULT_DAYS_BEFORE = 3;
+
+/**
+ * Past this many days overdue, a bill stops competing for the notification's
+ * three detail lines. It is still counted — see `composeReminder`.
+ */
+const STALE_AFTER_DAYS = 30;
 
 // Bounds the scan. Anything further out can't be inside a 0-30 day window.
 const SCAN_HORIZON_DAYS = 31;
@@ -67,31 +77,6 @@ function formatAmount(amount: number, currency: string): string {
   return `${SYMBOL[currency] ?? currency} ${n}`;
 }
 
-/**
- * Today as YYYY-MM-DD in a given IANA zone. en-CA formats as ISO, which saves
- * reassembling parts by hand. An unknown zone would throw, so fall back.
- */
-export function todayIn(timezone: string): string {
-  try {
-    return new Intl.DateTimeFormat('en-CA', {
-      timeZone: timezone,
-      year: 'numeric', month: '2-digit', day: '2-digit',
-    }).format(new Date());
-  } catch {
-    return new Intl.DateTimeFormat('en-CA', {
-      timeZone: DEFAULT_TZ,
-      year: 'numeric', month: '2-digit', day: '2-digit',
-    }).format(new Date());
-  }
-}
-
-/** Whole days from `from` to `to`, both YYYY-MM-DD. Negative means past. */
-export function daysBetween(from: string, to: string): number {
-  const a = Date.UTC(+from.slice(0, 4), +from.slice(5, 7) - 1, +from.slice(8, 10));
-  const b = Date.UTC(+to.slice(0, 4), +to.slice(5, 7) - 1, +to.slice(8, 10));
-  return Math.round((b - a) / 86_400_000);
-}
-
 export function describeDue(days: number): string {
   if (days < -1) return `vencida hace ${-days} días`;
   if (days === -1) return 'vencida ayer';
@@ -126,8 +111,16 @@ export function composeReminder(
     : `${n} cuenta${n === 1 ? '' : 's'} por vencer`;
   const title = `${SLOT_TITLE_PREFIX[slot]}${headline}`;
 
-  // Three lines keeps the notification readable on a lock screen.
-  const shown = sorted.slice(0, 3).map(b => b.label);
+  // Three lines keeps the notification readable on a lock screen — so which
+  // three is the whole question. Sorting by due date alone put the *oldest*
+  // debts first, which sounds right and isn't: someone carrying a bill from
+  // last year saw those same three lines every morning while the bill actually
+  // due today sat hidden behind "y 3 más". A bill nobody has paid in a month
+  // is not today's task, so the recent ones get the lines and the stale ones
+  // fall into the remainder count, where they are still counted.
+  const fresh = sorted.filter(b => b.days >= -STALE_AFTER_DAYS);
+  const stale = sorted.filter(b => b.days < -STALE_AFTER_DAYS);
+  const shown = [...fresh, ...stale].slice(0, 3).map(b => b.label);
   const rest = n - shown.length;
   const body = rest > 0 ? `${shown.join(' · ')} y ${rest} más` : shown.join(' · ');
 
@@ -180,7 +173,8 @@ export async function runDailyReminders(
      FROM (SELECT DISTINCT user_id FROM push_tokens WHERE disabled_at IS NULL) d
      LEFT JOIN user_preferences pf ON pf.user_id = d.user_id
      JOIN bills b
-       ON b.user_id = d.user_id AND b.deleted_at IS NULL AND b.paid_at IS NULL
+       ON b.user_id = d.user_id AND b.deleted_at IS NULL
+      AND b.paid_at IS NULL AND b.status <> 'pagada'
      LEFT JOIN providers p ON p.id = b.provider_id
      WHERE COALESCE(pf.notify_by_push, 1) = 1
        AND date(b.due_date) <= date('now', ?3)

@@ -150,6 +150,19 @@ describe('runDailyReminders', () => {
     expect((await runDailyReminders(env)).usersNotified).toBe(0);
   });
 
+  it('skips a legacy row marked pagada that never got a paid_at', async () => {
+    // Writes go through updateBill now, which keeps the two in step. Rows
+    // written before that still exist, and the sweep is the one place where
+    // trusting the wrong column means buzzing someone about a bill they paid.
+    await registerToken(TOKEN_A);
+    await seedBill({ id: 'b-1', providerId: 'p-1', dueDate: isoDaysFromLocalToday(1) });
+    await env.vence_db
+      .prepare(`UPDATE bills SET status='pagada', paid_at=NULL WHERE id='b-1'`)
+      .run();
+    stubExpo();
+    expect((await runDailyReminders(env)).usersNotified).toBe(0);
+  });
+
   it('skips a soft-deleted bill', async () => {
     await registerToken(TOKEN_A);
     await seedBill({ id: 'b-1', providerId: 'p-1', dueDate: isoDaysFromLocalToday(1) });

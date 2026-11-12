@@ -103,7 +103,7 @@ export async function seedBill(opts: {
     opts.providerId,
     opts.amount ?? 1200,
     opts.currency ?? 'UYU',
-    opts.dueDate ?? '2026-11-10',
+    opts.dueDate ?? isoDaysFromNow(30),
     opts.frequency ?? 'mensual',
     opts.paidAt ? 'pagada' : 'pendiente',
     opts.paidAt ?? null,

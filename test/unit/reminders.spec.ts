@@ -90,6 +90,39 @@ describe('composeReminder', () => {
     expect(r?.body).toBe('B1 · B2 · B3');
   });
 
+  it('keeps a bill due today visible behind a pile of ancient overdue ones', () => {
+    // Three lines, four bills, and the three oldest are from last year. Sorting
+    // by due date alone buried the only one that can be acted on today.
+    const r = composeReminder([
+      { label: 'Vieja 2024', days: -400 },
+      { label: 'Vieja 2025', days: -300 },
+      { label: 'Vieja marzo', days: -200 },
+      { label: 'UTE vence hoy', days: 0 },
+    ]);
+    // Today's bill leads; the stale ones fill what is left rather than
+    // disappearing, so the backlog stays visible without burying the task.
+    expect(r?.body).toBe('UTE vence hoy · Vieja 2024 · Vieja 2025 y 1 más');
+    expect(r?.billCount).toBe(4);
+    expect(r?.title).toBe('3 cuentas vencidas');
+  });
+
+  it('still leads with recently overdue bills, which are the urgent ones', () => {
+    const r = composeReminder([
+      { label: 'Antel vence en 3 dias', days: 3 },
+      { label: 'UTE vencida hace 2 dias', days: -2 },
+      { label: 'OSE vence manana', days: 1 },
+    ]);
+    expect(r?.body).toBe('UTE vencida hace 2 dias · OSE vence manana · Antel vence en 3 dias');
+  });
+
+  it('falls back to the stale ones when there is nothing else to show', () => {
+    const r = composeReminder([
+      { label: 'Vieja 2024', days: -400 },
+      { label: 'Vieja 2025', days: -300 },
+    ]);
+    expect(r?.body).toBe('Vieja 2024 · Vieja 2025');
+  });
+
   it('does not mutate the array it was given', () => {
     const input = [{ label: 'A', days: 5 }, { label: 'B', days: -1 }];
     composeReminder(input);

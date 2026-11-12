@@ -1,6 +1,7 @@
 import type { Env } from '../env';
 import type { AuthContext } from '../auth';
 import { json } from '../helpers/helpers';
+import { userToday, daysBetween } from '../helpers/dates';
 
 const VALID_CURRENCIES = ['UYU', 'USD', 'EUR', 'ARS'] as const;
 const VALID_FREQUENCIES = [
@@ -24,12 +25,17 @@ interface BillRow {
   updated_at: number;
 }
 
-function toDto(row: BillRow) {
+/**
+ * `today` is the caller's own calendar day, not UTC — see helpers/dates. It is
+ * a parameter rather than something read in here so that one request labels
+ * every row against a single date, and so the caller pays for the preference
+ * lookup once.
+ */
+function toDto(row: BillRow, today: string) {
   // Derive display status: unpaid + past due → 'vencida'. DB may still say
   // 'pendiente'; the label is a UI concern, not a stored state.
   let status = row.status;
   if (!row.paid_at && status === 'pendiente') {
-    const today = new Date().toISOString().slice(0, 10);
     if (row.due_date < today) status = 'vencida';
   }
 
@@ -165,7 +171,7 @@ export async function createBill(
        FROM bills WHERE id = ?1`
   ).bind(id).first<BillRow>();
 
-  return json(toDto(row!), 201, cors);
+  return json(toDto(row!, await userToday(env, auth.sub)), 201, cors);
 }
 
 // ────────────────────────── listBills ──────────────────────────
@@ -183,7 +189,8 @@ export async function listBills(
       ORDER BY due_date ASC`
   ).bind(auth.sub).all<BillRow>();
 
-  return json({ bills: (result.results ?? []).map(toDto) }, 200, cors);
+  const today = await userToday(env, auth.sub);
+  return json({ bills: (result.results ?? []).map(r => toDto(r, today)) }, 200, cors);
 }
 
 // ────────────────────────── updateBill ──────────────────────────
@@ -343,6 +350,23 @@ export async function updateBill(
     }
   }
 
+  // `status` and `paid_at` are two ways of saying the same thing, and every
+  // reader trusts a different one: the reminder sweep skips a bill on
+  // `paid_at`, the UI label derives from it, but `status` is what a client
+  // sends. Left to disagree, a bill marked 'pagada' with no `paid_at` read as
+  // paid on screen and still went out in the morning reminder. So whichever
+  // side the caller set, the other is brought into line here.
+  if (body.status !== undefined && body.paidAt === undefined) {
+    if (status === 'pagada' && paidAt === null) {
+      paidAt = new Date().toISOString();
+    } else if (status !== 'pagada' && paidAt !== null) {
+      paidAt = null;
+      amountPaid = body.amountPaid === undefined ? null : amountPaid;
+    }
+  } else if (body.paidAt !== undefined && body.status === undefined) {
+    status = paidAt === null ? 'pendiente' : 'pagada';
+  }
+
   await env.vence_db.prepare(
     `UPDATE bills
         SET provider_id = ?1, amount = ?2, currency = ?3, due_date = ?4,
@@ -362,7 +386,7 @@ export async function updateBill(
        FROM bills WHERE id = ?1`
   ).bind(billId).first<BillRow>();
 
-  return json(toDto(updated!), 200, cors);
+  return json(toDto(updated!, await userToday(env, auth.sub)), 200, cors);
 }
 
 // ────────────────────────── deleteBill ──────────────────────────
@@ -413,7 +437,7 @@ export async function deleteBill(
  *   addFrequency('2026-06-30', 'anual')   → '2027-06-30'
  *   addFrequency('2026-06-30', 'unica')   → null
  */
-function addFrequency(dueDate: string, frequency: string): string | null {
+export function addFrequency(dueDate: string, frequency: string): string | null {
   const months: Record<string, number> = {
     mensual: 1, bimestral: 2, trimestral: 3, semestral: 6, anual: 12,
   };
@@ -432,6 +456,41 @@ function addFrequency(dueDate: string, frequency: string): string | null {
   const mm = String(normalizedMonth + 1).padStart(2, '0');
   const dd = String(clampedDay).padStart(2, '0');
   return `${targetYear}-${mm}-${dd}`;
+}
+
+// A monthly bill left unpaid since last year would otherwise need a hundred
+// steps to catch up; nothing legitimate needs more than this.
+const MAX_CATCH_UP_PERIODS = 600;
+
+/**
+ * The next occurrence that hasn't happened yet.
+ *
+ * One step from the old due date is only right for a bill paid on time. Paying
+ * a monthly bill three months late produced an occurrence that was itself two
+ * months overdue — so the new row arrived already late, the reminder sweep
+ * announced it the next morning, and clearing the backlog meant paying the
+ * same bill over and over, each payment spawning another overdue one. Stepping
+ * until the date is no longer in the past ends that: the skipped periods were
+ * never rows to begin with, since an occurrence is only created when the
+ * previous one is paid.
+ *
+ * A date landing exactly on `today` is kept — that occurrence is due now, not
+ * late, and it is the one the user expects to see next.
+ */
+export function nextOccurrence(
+  dueDate: string,
+  frequency: string,
+  today: string,
+): string | null {
+  let next = addFrequency(dueDate, frequency);
+  if (next === null) return null; // 'unica' or unknown
+
+  for (let i = 0; next < today && i < MAX_CATCH_UP_PERIODS; i++) {
+    const stepped = addFrequency(next, frequency);
+    if (stepped === null || stepped === next) break;
+    next = stepped;
+  }
+  return next;
 }
 
 export async function payBill(
@@ -482,7 +541,8 @@ export async function payBill(
     amountPaid = existing.amount;
   }
 
-  const nextDue = addFrequency(existing.due_date, existing.frequency);
+  const today = await userToday(env, auth.sub);
+  const nextDue = nextOccurrence(existing.due_date, existing.frequency, today);
   const nextId = nextDue ? crypto.randomUUID() : null;
 
   const statements = [
@@ -527,7 +587,7 @@ export async function payBill(
   }
 
   return json({
-    paid: toDto(paidRow!),
-    next: nextRow ? toDto(nextRow) : null,
+    paid: toDto(paidRow!, today),
+    next: nextRow ? toDto(nextRow, today) : null,
   }, 200, cors);
 }

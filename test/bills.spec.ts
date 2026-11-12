@@ -1,9 +1,10 @@
-import { describe, it, expect, beforeAll, beforeEach } from 'vitest';
+import { describe, it, expect, beforeAll, beforeEach, vi } from 'vitest';
 import { env } from 'cloudflare:test';
 import {
   applySchema, reset, seedUser, seedProvider, seedBill,
   isoDaysFromNow, USER_A, USER_B,
 } from './helpers/db';
+import { addFrequency } from '../src/bills/bills';
 import { callJson } from './helpers/request';
 
 beforeAll(applySchema);
@@ -22,9 +23,12 @@ interface BillDto {
   createdAt: string; updatedAt: string;
 }
 
+// Relative to today, not a fixed date: a hardcoded one silently becomes a
+// past-due bill the moment it rolls by, and then every assertion about
+// 'pendiente' starts failing for reasons that have nothing to do with the code.
 const valid = {
   providerId: 'p-1', amount: 1200, currency: 'UYU',
-  dueDate: '2026-11-10', frequency: 'mensual',
+  dueDate: isoDaysFromNow(30), frequency: 'mensual',
 };
 
 describe('POST /bills', () => {
@@ -93,6 +97,39 @@ describe('GET /bills', () => {
     expect(body.bills[0].status).toBe('pendiente');
   });
 
+  it('does not call a bill vencida during the last hours of the day it is due', async () => {
+    // 00:30 UTC is 21:30 the previous day in Montevideo. Reading "today" from
+    // UTC turned every bill due today into an overdue one for the last three
+    // hours of its own due date.
+    vi.useFakeTimers();
+    vi.setSystemTime(new Date('2026-10-27T00:30:00Z'));
+    try {
+      await seedBill({ id: 'b-1', providerId: 'p-1', dueDate: '2026-10-26' });
+      const { body } = await callJson<{ bills: BillDto[] }>('/bills');
+      expect(body.bills[0].status).toBe('pendiente');
+    } finally {
+      vi.useRealTimers();
+    }
+  });
+
+  it('honours a timezone the user actually set, not just the default', async () => {
+    // 16:30 UTC on the 27th is still the 27th in Montevideo but already the
+    // 28th in Auckland, where this user is.
+    await env.vence_db.prepare(
+      `INSERT INTO user_preferences (user_id, timezone) VALUES (?1, 'Pacific/Auckland')`
+    ).bind(USER_A).run();
+
+    vi.useFakeTimers();
+    vi.setSystemTime(new Date('2026-10-27T16:30:00Z'));
+    try {
+      await seedBill({ id: 'b-1', providerId: 'p-1', dueDate: '2026-10-27' });
+      const { body } = await callJson<{ bills: BillDto[] }>('/bills');
+      expect(body.bills[0].status).toBe('vencida');
+    } finally {
+      vi.useRealTimers();
+    }
+  });
+
   it('never relabels a paid bill, even long past due', async () => {
     await seedBill({
       id: 'b-1', providerId: 'p-1',
@@ -138,6 +175,47 @@ describe('PATCH /bills/:id', () => {
     });
     expect(body.reference).toBeUndefined();
     expect(body.notes).toBeUndefined();
+  });
+
+  it('sets paidAt when a bill is marked pagada, so the reminder sweep agrees', async () => {
+    const { body } = await callJson<BillDto>('/bills/b-1', {
+      method: 'PATCH', body: { status: 'pagada' },
+    });
+
+    expect(body.status).toBe('pagada');
+    expect(body.paidAt).toBeDefined();
+
+    // The sweep reads paid_at, not status. Left null, a bill the user had
+    // ticked off still went out in the next morning's reminder.
+    const row = await env.vence_db
+      .prepare(`SELECT paid_at FROM bills WHERE id = 'b-1'`)
+      .first<{ paid_at: string | null }>();
+    expect(row?.paid_at).not.toBeNull();
+  });
+
+  it('clears paidAt when a bill is moved back to pendiente', async () => {
+    await callJson('/bills/b-1', {
+      method: 'PATCH', body: { paidAt: new Date().toISOString(), amountPaid: 1200 },
+    });
+
+    await callJson('/bills/b-1', { method: 'PATCH', body: { status: 'pendiente' } });
+
+    const row = await env.vence_db
+      .prepare(`SELECT paid_at, amount_paid FROM bills WHERE id = 'b-1'`)
+      .first<{ paid_at: string | null; amount_paid: number | null }>();
+    expect(row?.paid_at).toBeNull();
+    expect(row?.amount_paid).toBeNull();
+  });
+
+  it('derives status from paidAt when only paidAt is sent', async () => {
+    await callJson('/bills/b-1', {
+      method: 'PATCH', body: { paidAt: new Date().toISOString() },
+    });
+
+    const row = await env.vence_db
+      .prepare(`SELECT status FROM bills WHERE id = 'b-1'`)
+      .first<{ status: string }>();
+    expect(row?.status).toBe('pagada');
   });
 
   it('404s for another users bill', async () => {
@@ -201,25 +279,50 @@ describe('POST /bills/:id/pay', () => {
     expect((await callJson('/bills/nope/pay', { method: 'POST', body: {} })).status).toBe(404);
   });
 
-  it.each([
-    ['mensual', '2026-01-15', '2026-02-15'],
-    ['bimestral', '2026-01-15', '2026-03-15'],
-    ['trimestral', '2026-01-15', '2026-04-15'],
-    ['semestral', '2026-01-15', '2026-07-15'],
-    ['anual', '2026-01-15', '2027-01-15'],
-    // Clamping: no Feb 31st, and 2026 is not a leap year.
-    ['mensual', '2026-01-31', '2026-02-28'],
-    ['mensual', '2028-01-31', '2028-02-29'],
-    ['mensual', '2026-03-31', '2026-04-30'],
-    // Year rollover.
-    ['mensual', '2026-12-31', '2027-01-31'],
-    ['anual', '2028-02-29', '2029-02-28'],
-  ])('%s from %s creates the next occurrence on %s', async (frequency, dueDate, expected) => {
-    await seedBill({ id: 'b-1', providerId: 'p-1', dueDate, frequency });
+  // The month arithmetic itself is covered against addFrequency in
+  // test/unit/bills.spec.ts, where fixed dates mean what they say. Here the
+  // question is only what payBill does with it, which depends on today.
+  it.each(['mensual', 'bimestral', 'trimestral', 'semestral', 'anual'])(
+    '%s paid on time lands exactly one period out',
+    async frequency => {
+      const dueDate = isoDaysFromNow(2);
+      await seedBill({ id: 'b-1', providerId: 'p-1', dueDate, frequency });
+
+      const { body } = await callJson<{ next: BillDto | null }>('/bills/b-1/pay', {
+        method: 'POST', body: {},
+      });
+
+      expect(body.next?.dueDate).toBe(addFrequency(dueDate, frequency));
+    },
+  );
+
+  it('never hands back an occurrence that is already overdue', async () => {
+    // Nine months unpaid. Stepping once would produce a row due eight months
+    // ago, which the next sweep would announce as overdue the same night.
+    await seedBill({
+      id: 'b-1', providerId: 'p-1',
+      dueDate: isoDaysFromNow(-270), frequency: 'mensual',
+    });
+
     const { body } = await callJson<{ next: BillDto | null }>('/bills/b-1/pay', {
       method: 'POST', body: {},
     });
-    expect(body.next?.dueDate).toBe(expected);
+
+    expect(body.next!.dueDate >= isoDaysFromNow(0)).toBe(true);
+    expect(body.next!.status).toBe('pendiente');
+  });
+
+  it('does not create a next occurrence for a one-off bill', async () => {
+    await seedBill({
+      id: 'b-1', providerId: 'p-1',
+      dueDate: isoDaysFromNow(-270), frequency: 'unica',
+    });
+
+    const { body } = await callJson<{ next: BillDto | null }>('/bills/b-1/pay', {
+      method: 'POST', body: {},
+    });
+
+    expect(body.next).toBeNull();
   });
 
   it('carries provider, amount, currency, frequency and reference to the next occurrence but not notes', async () => {
